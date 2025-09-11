@@ -17,11 +17,12 @@ use std::io::Write as _;
 
 use clap::builder::PossibleValue;
 use clap::builder::StyledStr;
-use clap::error::ContextKind;
+use clap::ArgMatches;
 use crossterm::style::Stylize as _;
 use itertools::Itertools as _;
 use tracing::instrument;
 
+use crate::cli_util::resolve_aliases;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
@@ -59,31 +60,60 @@ pub(crate) fn cmd_help(
         return Ok(());
     }
 
-    let bin_name = command
-        .string_args()
-        .first()
-        .map_or(command.app().get_name(), |name| name.as_ref());
-    let mut args_to_get_command = vec![bin_name];
-    args_to_get_command.extend(args.command.iter().map(|s| s.as_str()));
+    let mut app = command.app().clone().ignore_errors(true).no_binary_name(true);
 
-    let mut app = command.app().clone();
+    let input_args: Vec<String> = args.command.iter().map(|s| s.clone()).collect();
+
+    let resolved_command = resolve_aliases(
+        ui,
+        command.settings().config(),
+        &app,
+        // DON'T SEND UPSTREAM: why do we need to clone here?
+        // DON'T SEND UPSTREAM: should we really be using `?` here?
+        input_args.clone())?;
+    let alias_used = input_args != resolved_command;
+
     // This propagates global arguments to subcommand, and generates error if
     // the subcommand doesn't exist.
-    if let Err(err) = app.try_get_matches_from_mut(args_to_get_command) {
-        if err.get(ContextKind::InvalidSubcommand).is_some() {
-            return Err(err.into());
-        } else {
-            // `help log -- -r`, etc. shouldn't generate an argument error.
+    let got = app.try_get_matches_from_mut(resolved_command.iter())?;
+
+    // // Cases to worry about:
+    // // `jj help log`
+    // // `jj help log -- -r`
+    // // `jj help log_alias` (log_alias=`log`)
+    // // `jj help lr_alias` (lr_alias=`log -r`) [we'll need to ignore `-r` here!]
+    // // `jj help global_flag_alias` (global_flag_alias=`--config ...`)
+    // // `jj help foo bar baz`
+    // // `jj help foobar_alias baz` (foobar_alias=`foo bar`)
+
+    // Extract subcommands
+    let mut subcommands = vec![];
+    // DON'T SEND UPSTREAM: Obviously this is bad ;)
+    fn foo(acc: &mut Vec<String>, c: &ArgMatches) {
+        if let Some((name, args)) = c.subcommand() {
+            acc.push(name.to_string());
+            foo(acc, args);
         }
     }
-    let command = args
-        .command
+    foo(&mut subcommands, &got);
+
+    let command = subcommands
         .iter()
         .try_fold(&mut app, |cmd, name| cmd.find_subcommand_mut(name))
         .ok_or_else(|| cli_error(format!("Unknown command: {}", args.command.join(" "))))?;
 
+    // DON'T SEND UPSTREAM: doesn't work with `global_flag_alias`?
     ui.request_pager();
     let help_text = command.render_long_help();
+    if alias_used {
+        let styles = command.get_styles();
+        // DON'T SEND UPSTREAM: Do something better than this.
+        let style_header = styles.get_header().render();
+        let style_header_reset = styles.get_header().render_reset();
+        let style_literal = styles.get_literal().render();
+        let style_literal_reset = styles.get_literal().render_reset();
+        write!(ui.stdout(), "{style_header}Alias:{style_header_reset} {style_literal}{}{style_literal_reset} is an alias that resolves to {style_literal}{}{style_literal_reset}\n\n", input_args.join(" "), resolved_command.join(" "))?;
+    }
     if ui.color() {
         write!(ui.stdout(), "{}", help_text.ansi())?;
     } else {

@@ -3400,7 +3400,7 @@ fn resolve_default_command(
     Ok(string_args)
 }
 
-fn resolve_aliases(
+pub fn resolve_aliases(
     ui: &Ui,
     config: &StackedConfig,
     app: &Command,
